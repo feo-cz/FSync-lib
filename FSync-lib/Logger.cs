@@ -64,6 +64,11 @@ namespace FSync_lib
         {
             FileInfo actualLogFile = new FileInfo(actualLogName);
 
+            if (!actualLogFile.Exists)
+            {
+                return;
+            }
+
             int actualLogLength = Int32.Parse(actualLogFile.Length.ToString());
 
             if(actualLogLength / 1024 / 1024 > 0)
