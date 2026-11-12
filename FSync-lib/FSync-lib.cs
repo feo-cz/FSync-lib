@@ -69,6 +69,8 @@ namespace FSync_lib
                 }
             }
 
+            CommitIndex();
+
             Logger.Instance.Log("--------------------------------------------------------------------------");
             Logger.Instance.Log("STOP FSync " + DateTime.Now.ToString("dd.MM.yyyy HH:mm:ss"));
             Logger.Instance.Log("--------------------------------------------------------------------------");
@@ -131,9 +133,14 @@ namespace FSync_lib
                 {
                     file.CopyTo(destinationDirectory + "tmp\\" + file.Name, allowOverwriteExistingFiles);
                 }
-                catch (UnauthorizedAccessException ioex)
+                catch (Exception ex)
                 {
-                    Logger.Instance.Log(ioex.Message);
+                    if (!(ex is IOException || ex is UnauthorizedAccessException))
+                    {
+                        throw;
+                    }
+
+                    Logger.Instance.Log(file.FullName + ": " + ex.Message);
 
                     return false;
                 }
@@ -150,9 +157,16 @@ namespace FSync_lib
                 {
                     file.CopyTo(filePath, allowOverwriteExistingFiles);
                 }
-                catch (UnauthorizedAccessException ioex)
+                catch (Exception ex)
                 {
+                    if (!(ex is IOException || ex is UnauthorizedAccessException))
+                    {
+                        throw;
+                    }
 
+                    Logger.Instance.Log(file.FullName + ": " + ex.Message);
+
+                    return false;
                 }
             }
 
@@ -176,49 +190,87 @@ namespace FSync_lib
             return true;
         }
 
+        private static string IndexPath()
+        {
+            return sourceDirectory + indexFileName;
+        }
+
+        private static string NewIndexPath()
+        {
+            return IndexPath() + ".new";
+        }
+
+        // index is swapped in only after a finished run, so an interrupted run keeps the old one
         private static void IndexFiles(FileInfo[] files)
         {
             int countMoveFiles = 0;
 
-            List<Array> dataFromIndex = getDataFromIndex();
+            Dictionary<string, string> dataFromIndex = getDataFromIndex();
 
-            string indexFileName = FSync_lib.indexFileName;
+            string newIndexFileName = indexFileName + ".new";
 
-            using (StreamWriter sw = new StreamWriter(sourceDirectory + indexFileName))
+            using (StreamWriter sw = new StreamWriter(NewIndexPath()))
             {
                 foreach (FileInfo file in files)
                 {
-                    if (file.Name == indexFileName)
+                    if (file.Name == indexFileName || file.Name == newIndexFileName)
                     {
                         continue;
                     }
 
-                    string filePathName = file.FullName;
+                    string time = GetFileTimestamp(file).ToString();
 
-                    int time = DateTimeToUnixTimestamp(file.LastWriteTimeUtc);
-
-                    if (DateTimeToUnixTimestamp(file.CreationTimeUtc) > time)
+                    if (isNewFile(dataFromIndex, file.FullName, time))
                     {
-                        time = DateTimeToUnixTimestamp(file.CreationTimeUtc);
-                    }
-
-                    int lastWriteUnixTimestamp = time;
-
-                    if (isNewFile(dataFromIndex, file))
-                    {
-                        if(moveFile(file))
+                        if (!moveFile(file))
                         {
-                            countMoveFiles++;
+                            // not indexed, so the transfer is retried next run
+                            continue;
                         }
+
+                        countMoveFiles++;
                     }
 
-                    sw.WriteLine(filePathName + "|" + lastWriteUnixTimestamp);
+                    sw.WriteLine(file.FullName + "|" + time);
                 }
 
                 sw.Flush();
             }
 
             Logger.Instance.Log("Moved " + countMoveFiles + " files.");
+        }
+
+        private static void CommitIndex()
+        {
+            if (File.Exists(IndexPath()))
+            {
+                try
+                {
+                    File.Replace(NewIndexPath(), IndexPath(), null);
+
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // File.Replace is not supported on some network shares
+                    if (!(ex is IOException || ex is PlatformNotSupportedException))
+                    {
+                        throw;
+                    }
+                }
+
+                File.Delete(IndexPath());
+            }
+
+            File.Move(NewIndexPath(), IndexPath());
+        }
+
+        private static int GetFileTimestamp(FileInfo file)
+        {
+            int time = DateTimeToUnixTimestamp(file.LastWriteTimeUtc);
+            int creationTime = DateTimeToUnixTimestamp(file.CreationTimeUtc);
+
+            return creationTime > time ? creationTime : time;
         }
 
         private static bool compressFilesToZip()
@@ -349,48 +401,38 @@ namespace FSync_lib
             Directory.Delete(targetDir, false);
         }
 
-        private static List<Array> getDataFromIndex()
+        private static Dictionary<string, string> getDataFromIndex()
         {
-            List<Array> filesList = new List<Array>();
+            Dictionary<string, string> filesList = new Dictionary<string, string>(StringComparer.Ordinal);
 
-            FileInfo index = new FileInfo(sourceDirectory + indexFileName);
-            if (!index.Exists)
+            if (!File.Exists(IndexPath()))
             {
-                var file = index.Create();
-                file.Close();
+                return filesList;
             }
 
-            using (StreamReader sr = new StreamReader(sourceDirectory + indexFileName))
+            using (StreamReader sr = new StreamReader(IndexPath()))
             {
                 string s;
                 while ((s = sr.ReadLine()) != null)
                 {
-                    string[] exploded = s.Split('|');
-                    filesList.Add(exploded);
+                    int separator = s.LastIndexOf('|');
+                    if (separator < 0)
+                    {
+                        continue;
+                    }
+
+                    filesList[s.Substring(0, separator)] = s.Substring(separator + 1);
                 }
             }
 
             return filesList;
         }
 
-        private static bool isNewFile(List<Array> filesFromIndex, FileInfo file)
+        private static bool isNewFile(Dictionary<string, string> filesFromIndex, string fullName, string time)
         {
-            foreach (string[] fileFromIndex in filesFromIndex)
-            {
-                int time = DateTimeToUnixTimestamp(file.LastWriteTimeUtc);
+            string indexedTime;
 
-                if(DateTimeToUnixTimestamp(file.CreationTimeUtc) > time)
-                {
-                    time = DateTimeToUnixTimestamp(file.CreationTimeUtc);
-                }
-
-                if (fileFromIndex[0] == file.FullName && fileFromIndex[1] == time.ToString())
-                {
-                    return false;
-                }
-            }
-
-            return true;
+            return !filesFromIndex.TryGetValue(fullName, out indexedTime) || indexedTime != time;
         }
 
         private static void createDirectory(string directoryName)
